@@ -79,6 +79,7 @@ class SaxsFitter(object):
             self.dI = np.empty(self.I.shape)
             self.dI.fill(np.nan)
             self.dI[self.idx_fit] = np.sqrt(self.I[self.idx_fit])
+        self.param_constraints=None
 
     def fit(self,params=None,fixed_params=None,param_limits=None,error_weighted=True,objective='chi2log'):
         """Fit the SAXS spectrum, optionally holding some parameters fixed.
@@ -233,13 +234,21 @@ class SaxsFitter(object):
             for idx in range(len(v)):
                 v[idx] = param_limits[k]
         if param_bounds is not None:
-            pb = update_params(pb,param_bounds) 
+            pb = update_params(pb,param_bounds)
+        # param constraints  
+        pc = self.default_params()
+        for k,v in pc.items():
+            for idx in range(len(v)):
+                v[idx] = None
+        if self.param_constraints is not None:
+            pc = update_params(pc,self.param_constraints) 
         # lmfit 
         lmfp = lmfit.Parameters()
         for pkey,pvals in p.items():
             for i,val in enumerate(pvals):
                 lmfp.add(pkey+str(i),value=val,vary=not fp[pkey][i],
-                    min=pb[pkey][i][0],max=pb[pkey][i][1])
+                    min=pb[pkey][i][0],max=pb[pkey][i][1],
+                    expr=pc[pkey][i])
         return lmfp
 
     def saxskit_params(self,lmfit_params):
@@ -261,39 +270,100 @@ class SaxsFitter(object):
                     v[idx] = True
         return self.fit(params,fp)
 
-    def estimate_peak_params(self,params=None):
+    def estimate_fcc_params(self,npks_fcc=None,params=None):
         if params is None:
             params = self.default_params()
-        if bool(self.populations['diffraction_peaks']):
-            # 1) walk the spectrum, collect best diff. pk. candidates
-            pk_idx, pk_conf = peak_finder.peaks_by_window(self.q,self.I,20,0.)
-            conf_idx = np.argsort(pk_conf)[::-1]
+        if npks_fcc is None:
+            npks_fcc = self.populations['diffraction_peaks']
+        pk_idx, pk_conf = peak_finder.peaks_by_window(self.q,self.I,20,0.)
+        q_pks = [self.q[ipk] for ipk in pk_idx]
+        pk_idx_fcc = self.fcc_pk_indices(q_pks,npks_fcc) 
+        # TODO: finish this
+        #return params, constraints
+
+    def fcc_pk_indices(q_pks,npks_fcc):
+        best_res = np.inf
+        for i_pk in range(len(q_pks))[:int(-1*(npks_fcc-1))]:
+            # start with the lowest-q remaining peak as the fundamental peak
+            fcc_pks_i = [q_pks[i_pk]]
+            # solve the lowest several fcc-allowed peaks, 
+            # assuming this is the fundamental peak
+            hkl = [1,1,1]
+            hkl_planes = [hkl]
+            while len(fcc_pks_i < npks_fcc):
+                hkl = self.augment_hkl(hkl)
+                if all(idx % 2 == 0 for idx in hkl) \
+                or not any(idx % 2 == 0 for idx in hkl) \
+                and not hkl in hkl_planes:
+                    q_factor = np.sqrt(np.sum(np.array(hkl)**2))
+                    fcc_pks_i.append(fcc_pks_i[0]*q_factor)
+                    hkl_planes.append(hkl)
+                    # else, it is fcc-forbidden.
+
+            # get the nearest actual peaks
+            pk_idxs = [i_pk]
+            for fcc_pk in fcc_pks_i[1:]:
+                q_distance = (np.array(q_pks)-fcc_pk)**2
+                pk_test_order = np.argsort(q_distance)
+                found=False
+                for idx_test in pk_test_order:
+                    if not found and not idx_test in pk_idxs:
+                        pk_idxs.append(idx_test)
+                        found=True
+
+            pks_i = np.array([q_pks[pk_idx] for pk_idx in pk_idxs])
+            res = np.sum((fcc_pks_i-pks_i)**2)
+            if res < best_res:
+                best_pk_idxs = pk_idxs
+                best_res = res
+        return best_pk_idxs
+
+    @staticmethod
+    def augment_hkl(self,hkl):
+        hkl = copy.copy(hkl)
+        if hkl[0] > hkl[1]:
+            hkl[1] += 1
+        elif hkl[1] > hkl[2]:
+            hkl[2] += 1
+        else:
+            hkl[0] += 1
+        return hkl 
+
+    def estimate_peak_params(self,npk=None,params=None):
+        if params is None:
+            params = OrderedDict() 
             params['q_pkcenter'] = []
             params['I_pkcenter'] = []
             params['pk_hwhm'] = []
-            npk = 0
-            # 2) for each peak (from best candidate to worst),
-            for idx in conf_idx:
-                if npk < self.populations['diffraction_peaks']:
-                    # a) record the q value
-                    q_pk = self.q[pk_idx[idx]]
-                    # b) estimate the intensity
-                    I_at_qpk = self.I[pk_idx[idx]]
-                    I_pk = I_at_qpk * 0.1
-                    #I_pk = I_at_qpk - I_nopeaks[pk_idx[idx]] 
-                    # c) estimate the width
-                    idx_around_pk = (self.q>0.95*q_pk) & (self.q<1.05*q_pk)
-                    qs,qmean,qstd = saxs_math.standardize_array(self.q[idx_around_pk])
-                    Is,Imean,Istd = saxs_math.standardize_array(self.I[idx_around_pk])
-                    p_pk = np.polyfit(qs,Is,2,None,False,np.ones(len(qs)),False)
-                    # quadratic vertex horizontal coord is -b/2a
-                    #qpk_quad = -1*p_pk[1]/(2*p_pk[0])
-                    # quadratic focal width is 1/a 
-                    p_pk_fwidth = abs(1./p_pk[0])*qstd
-                    params['q_pkcenter'].append(float(q_pk))
-                    params['I_pkcenter'].append(float(I_pk))
-                    params['pk_hwhm'].append(float(p_pk_fwidth*0.5))
-                    npk += 1    
+        if npk is None or npk > self.populations['diffraction_peaks']:
+            npk = self.populations['diffraction_peaks']
+        # 1) walk the spectrum, collect best diff. pk. candidates
+        pk_idx, pk_conf = peak_finder.peaks_by_window(self.q,self.I,20,0.)
+        conf_idx = np.argsort(pk_conf)[::-1]
+        nfound = 0 
+        ntotal = len(params['q_pkcenter'])
+        # 2) for each peak (from best candidate to worst),
+        for idx in conf_idx:
+            if nfound < npk and ntotal < self.populations['diffraction_peaks']: 
+                # a) record the q value
+                q_pk = q_I[:,0][pk_idx[idx]]
+                # b) estimate the intensity
+                I_at_qpk = q_I[:,1][pk_idx[idx]]
+                I_pk = I_at_qpk * 0.1
+                #I_pk = I_at_qpk - I_nopeaks[pk_idx[idx]] 
+                # c) estimate the width
+                idx_around_pk = (q_I[:,0]>0.95*q_pk) & (q_I[:,0]<1.05*q_pk)
+                qs,qmean,qstd = saxs_math.standardize_array(q_I[idx_around_pk,0])
+                Is,Imean,Istd = saxs_math.standardize_array(q_I[idx_around_pk,1])
+                p_pk = np.polyfit(qs,Is,2,None,False,np.ones(len(qs)),False)
+                # quadratic vertex horizontal coord is -b/2a
+                #qpk_quad = -1*p_pk[1]/(2*p_pk[0])
+                # quadratic focal width is 1/a 
+                p_pk_fwidth = abs(1./p_pk[0])*qstd
+                params['q_pkcenter'].append(q_pk)
+                params['I_pkcenter'].append(I_pk)
+                params['pk_hwhm'].append(p_pk_fwidth*0.5)
+                nfound += 1    
         return params
 
 
